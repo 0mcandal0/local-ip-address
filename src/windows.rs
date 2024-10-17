@@ -1,6 +1,6 @@
 use std::{
     alloc::{alloc, dealloc, Layout},
-    net::IpAddr,
+    net::{IpAddr, Ipv4Addr},
     ptr::{NonNull, null_mut, self},
     slice,
     marker::PhantomData,
@@ -8,8 +8,7 @@ use std::{
     mem,
 };
 
-use std::ffi::CStr;
-
+use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceLuidToIndex;
 
 use windows_sys::Win32::{
     Foundation::{
@@ -20,9 +19,7 @@ use windows_sys::Win32::{
     NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GetIpForwardTable, GET_ADAPTERS_ADDRESSES_FLAGS,
         IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH, MIB_IPFORWARDTABLE,
-    },
-    Networking::IpHelper::{
-        GetIpForwardTable, MIB_IPFORWARDTABLE
+        MIB_IPFORWARDROW,
     },
     Networking::WinSock::{
         ADDRESS_FAMILY, AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR,
@@ -88,30 +85,7 @@ pub(crate) fn list_local_ip_addresses(family: ADDRESS_FAMILY) -> Result<Vec<IpAd
         })
         .collect();
 
-
-
     Ok(local_ip_address)
-}
-
-
-fn get_gateway_for_interface(interface_ip: &Option<IpAddr>) -> Option<IpAddr> {
-    let mut table: [MIB_IPFORWARDTABLE; 1] = Default::default();
-    let mut table_size = std::mem::size_of::<MIB_IPFORWARDTABLE>() as u32;
-    
-    unsafe {
-        if GetIpForwardTable(table.as_mut_ptr() as *mut _, &mut table_size, 0) == 0 {
-            let entries = table[0].dwNumEntries;
-            let routes = slice::from_raw_parts(table[0].table, entries as usize);
-
-            for route in routes {
-                // Comprobar si la interfaz de la ruta coincide con la IP de la interfaz
-                if route.dwForwardIfIndex == interface_ip {
-                    return Some(route.dwForwardNextHop); // Esto necesita conversión a IpAddr
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Perform a search over the system's network interfaces using `GetAdaptersAddresses`,
@@ -133,43 +107,27 @@ fn get_gateway_for_interface(interface_ip: &Option<IpAddr>) -> Option<IpAddr> {
 ///     println!("This is your local IP address: {:?}", ipaddr);
 /// }
 /// ```
-pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr, Option<String>, Option<String>, Option<IpAddr>)>, Error> {
-
+pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr, String, String, Option<IpAddr>)>, Error>
+{
     let adapter_addresses = get_adapter_addresses(AF_UNSPEC, 0)
         .map_err(|error_code| Error::StrategyError(format_error_code(error_code)))?;
 
-    let adapter_addresses_iter = LinkedListIter::new(Some(adapter_addresses.ptr));
-
-    let network_interfaces = adapter_addresses_iter
+    Ok(LinkedListIter::new(Some(adapter_addresses.ptr))
         .flat_map(|adapter_address| {
-            let unicast_addresses_iter =
-                LinkedListIter::new(NonNull::new(adapter_address.FirstUnicastAddress));
-
             let friendly_name = unsafe {
-                #[allow(unused_unsafe)]
-                // SAFETY: This is basically how `wcslen` works under the hood. `wcslen` is unsafe because the pointer
-                // is not checked for null and if there is no null-terminating character, it will run forever.
-                // Therefore, safety relies on the operating sysytem always returning a valid string.
-                let len = unsafe {
-                    let mut ptr = adapter_address.FriendlyName;
-                    while *ptr != 0 {
-                        ptr = ptr.offset(1);
-                    }
-                    ptr.offset_from(adapter_address.FriendlyName)
-                        .try_into()
-                        .unwrap()
-                };
-
-                slice::from_raw_parts(adapter_address.FriendlyName, len)
+                let len = (0..)
+                    .take_while(|&i| *adapter_address.FriendlyName.offset(i) != 0)
+                    .count();
+                String::from_utf16_lossy(slice::from_raw_parts(adapter_address.FriendlyName, len))
             };
 
             let service_name = unsafe {
-                std::ffi::CStr::from_ptr(adapter_address.AdapterName.as_ptr())
-                    .to_string_lossy()
-                    .into_owned()
-            };
+                let name_bytes = slice::from_raw_parts(adapter_address.AdapterName, 256);
 
-            // Obtener la MAC address
+                let len = name_bytes.iter().position(|&x| x == 0).unwrap_or(0);
+
+                String::from_utf8_lossy(&name_bytes[..len]).into_owned()
+            };
             let mac_address = {
                 let bytes = unsafe {
                     slice::from_raw_parts(
@@ -184,20 +142,49 @@ pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr, Option<String>, Opti
                     .join(":")
             };
 
-            let ip_address = { unicast_addresses_iter.filter_map(|unicast_address| {
-                    let socket_address = NonNull::new(unicast_address.Address.lpSockaddr)?;
-                    get_ip_address_from_socket_address(socket_address)
-                        .map(|ip_address| (String::from_utf16_lossy(friendly_name), ip_address))
-                })
-            };
+            LinkedListIter::new(NonNull::new(adapter_address.FirstUnicastAddress)).filter_map(
+                move |unicast_address| {
+                    let ip_address = NonNull::new(unicast_address.Address.lpSockaddr)
+                        .and_then(get_ip_address_from_socket_address)?;
+                    let interface_index = adapter_address.Luid;
 
-            let gateway = get_gateway_for_interface(&ip_address);
+                    let mut ipv4_if_index: u32 = 0;
+                    let result = unsafe {
+                        ConvertInterfaceLuidToIndex(&adapter_address.Luid, &mut ipv4_if_index)
+                    };
+                    let mut gateway = None;
+                    if result == 0 {
+                        println!("----------> {:?}", ipv4_if_index);
+                        gateway = get_gateway_for_interface(ipv4_if_index);
+                    }
 
-            (friendly_name, ip_address, service_name, mac_address, gateway)
+                    Some((
+                        friendly_name.clone(),
+                        ip_address,
+                        mac_address.clone(),
+                        service_name.clone(),
+                        gateway,
+                    ))
+                },
+            )
         })
-        .collect();
+        .collect())
+}
 
-    Ok(network_interfaces)
+fn get_gateway_for_interface(interface_index: u32) -> Option<IpAddr> {
+    let ip_forward_table = get_ip_forward_table(0).unwrap();
+
+    let table = unsafe {
+        slice::from_raw_parts(
+            ip_forward_table.table.as_ptr(),
+            ip_forward_table.dwNumEntries.try_into().unwrap(),
+        )
+    };
+
+    table
+        .iter()
+        .find(|row| row.dwForwardDest == 0 && interface_index == row.dwForwardIfIndex)
+        .map(|row| IpAddr::V4(Ipv4Addr::from(u32::from_be(row.dwForwardNextHop))))
 }
 
 /// The [GetIpForwardTable][GetIpForwardTable] function retrieves the IPv4 routing table.

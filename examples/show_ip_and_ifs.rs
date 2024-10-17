@@ -25,7 +25,7 @@ fn main() {
         Ok(netifs) => {
             println!("Got {} interfaces", netifs.len());
             for netif in netifs {
-                println!("IF: {}, IP: {}, MAC: {:?}, GW: {:?}", netif.0, netif.1, netif.2, netif.4);
+                println!("IF: {}, IP: {}, MAC: {:?}, SN: {:?} GW: {:?}", netif.0, netif.1, netif.2, netif.3, netif.4);
             }
         }
         Err(err) => println!("Failed to get list of network interfaces: {}", err),
