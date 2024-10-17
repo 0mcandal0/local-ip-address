@@ -386,7 +386,7 @@ fn local_ip_impl_addr(
 ///     println!("This is your local IP address: {:?}", ipaddr);
 /// }
 /// ```
-pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr)>, Error> {
+pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr, Option<String>, Option<String>, Option<IpAddr>)>, Error> {
     let mut netlink_socket = NlSocketHandle::connect(NlFamily::Route, None, &[])
         .map_err(|err| Error::StrategyError(err.to_string()))?;
 
@@ -415,7 +415,8 @@ pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr)>, Error> {
         .map_err(|err| Error::StrategyError(err.to_string()))?;
 
     let mut if_indexes = HashMap::new();
-
+    let mut interface_mac = HashMap::new();
+    
     for response in netlink_socket.iter(false) {
         let header: Nlmsghdr<Rtm, Ifinfomsg> = response.map_err(|_| {
             Error::StrategyError(String::from(
@@ -438,6 +439,29 @@ pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr)>, Error> {
                 "An error occurred getting Netlink's header payload",
             ))
         })?;
+
+        let ifname = p.rtattrs.iter().find_map(|rtattr| {
+            if rtattr.rta_type == Ifla::Ifname {
+                Some(parse_ifname(rtattr.payload().as_ref()).ok())
+            } else {
+                None
+            }
+        }).flatten();
+
+        if let Some(ifname) = ifname {
+            if_indexes.insert(p.ifi_index, ifname.clone());
+
+            // Get MAC address
+            let mac_address = p.rtattrs.iter().find_map(|rtattr| {
+                if rtattr.rta_type == Ifla::Address {
+                    Some(rtattr.payload().as_ref().to_vec())
+                } else {
+                    None
+                }
+            }).map(|mac| mac.iter().map(|b| format!("{:02x}", b)).collect::<Vec<_>>().join(":"));
+
+            interface_mac.insert(ifname, mac_address);
+        }
 
         for rtattr in p.rtattrs.iter() {
             if rtattr.rta_type == Ifla::Ifname {
@@ -505,6 +529,7 @@ pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr)>, Error> {
 
         let mut ipaddr = None;
         let mut label = None;
+        
 
         for rtattr in p.rtattrs.iter() {
             if rtattr.rta_type == Ifa::Label {
@@ -557,17 +582,122 @@ pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr)>, Error> {
             }
         }
 
+        // if let Some(ipaddr) = ipaddr {
+        //     if let Some(ifname) = label {
+        //         interfaces.push((ifname, ipaddr));
+        //     } else if let Some(ifname) = if_indexes.get(&p.ifa_index) {
+        //         interfaces.push((ifname.clone(), ipaddr));
+        //     }
+        // }
         if let Some(ipaddr) = ipaddr {
-            if let Some(ifname) = label {
-                interfaces.push((ifname, ipaddr));
-            } else if let Some(ifname) = if_indexes.get(&p.ifa_index) {
-                interfaces.push((ifname.clone(), ipaddr));
+            let ifname = label.clone().unwrap_or_else(|| if_indexes.get(&p.ifa_index).unwrap().clone());
+            let mac = interface_mac.get(&ifname).cloned().unwrap_or(None);
+            interfaces.push((ifname, ipaddr, mac, None, None));
+        }
+    }
+
+    let ifaddrmsg = Ifaddrmsg {
+        ifa_family: RtAddrFamily::Unspecified,
+        ifa_prefixlen: 0,
+        ifa_flags: IfaFFlags::empty(),
+        ifa_scope: 0,
+        ifa_index: 0,
+        rtattrs: RtBuffer::new(),
+    };
+    
+    let route_msg = Nlmsghdr::new(
+        None,
+        Rtm::Getroute,
+        NlmFFlags::new(&[NlmF::Request, NlmF::Dump]),
+        None,
+        None,
+        NlPayload::Payload(ifaddrmsg),
+    );
+
+    let mut interface_gateway = HashMap::new();
+
+    netlink_socket
+        .send(route_msg)
+        .map_err(|err| Error::StrategyError(err.to_string()))?;
+
+    for response in netlink_socket.iter(false) {
+        let header: Nlmsghdr<Rtm, Rtmsg> = response.map_err(|err| {
+            Error::StrategyError(format!(
+                "An error occurred retrieving Netlink's socket response: {err}"
+            ))
+        })?;
+
+        if let NlPayload::Empty = header.nl_payload {
+            continue;
+        }
+
+        if header.nl_type != Rtm::Newroute {
+            continue;
+        }
+
+
+        let p = header.get_payload().map_err(|_| {
+            Error::StrategyError(String::from(
+                "An error occurred getting Netlink's header payload",
+            ))
+        })?;
+
+
+        let mut gateway: Option<IpAddr> = None;
+        let mut ifname: String = String::new();
+
+        for rtattr in p.rtattrs.iter() {
+            if rtattr.rta_type == Rta::Oif {
+                let ifn_idx = rtattr.get_payload_as::<i32>().unwrap();
+                let ifn = if_indexes.get(&ifn_idx).unwrap();
+                ifname = ifn.clone();
+            }
+            else if rtattr.rta_type == Rta::Gateway {
+
+                if p.rtm_family == RtAddrFamily::Inet6 {
+                    let rtaddr = Ipv6Addr::from(u128::from_be(
+                        rtattr.get_payload_as::<u128>().map_err(|_| {
+                            Error::StrategyError(String::from(
+                                "An error occurred retrieving Netlink's route payload attribute",
+                            ))
+                        })?,
+                    ));
+                    gateway = Some(IpAddr::V6(rtaddr));
+                } else {
+                    let rtaddr = Ipv4Addr::from(u32::from_be(
+                        rtattr.get_payload_as::<u32>().map_err(|_| {
+                            Error::StrategyError(String::from(
+                                "An error occurred retrieving Netlink's route payload attribute",
+                            ))
+                        })?,
+                    ));
+                    gateway = Some(IpAddr::V4(rtaddr));
+                }
+
+                
+            }
+            if ifname != "" && gateway.is_some() {
+                break;
             }
         }
+
+        if ifname != "" && gateway.is_some() {
+            if !interface_gateway.contains_key(&ifname) {
+                interface_gateway.insert(ifname, gateway.unwrap());    
+            }            
+        }
+                
+    }
+
+    for i in interfaces.iter_mut() {
+        let gateway = interface_gateway.get(&i.0).cloned();
+        i.4 = gateway;
     }
 
     Ok(interfaces)
 }
+
+
 
 /// Parse network interface name of slice type to string type.
 /// If the slice is suffixed with '\0', this suffix will be removed when parsing.

@@ -29,11 +29,11 @@ type IfAddrsPtr = *mut *mut ifaddrs;
 ///     println!("This is your local IP address: {:?}", ipaddr);
 /// }
 /// ```
-pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr)>, Error> {
+pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr, Option<String>, Option<String>, Option<IpAddr>)>, Error> {
     match list_afinet_netifas_info() {
         Ok(interfaces) => Ok(interfaces
             .iter()
-            .map(|i| (i.iname.clone(), i.addr))
+            .map(|i| (i.iname.clone(), i.addr, None, None, None))
             .collect()),
         Err(e) => Err(e),
     }

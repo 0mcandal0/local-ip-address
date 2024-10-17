@@ -1,12 +1,15 @@
 use std::{
     alloc::{alloc, dealloc, Layout},
     net::IpAddr,
-    ptr::{NonNull, self},
+    ptr::{NonNull, null_mut, self},
     slice,
     marker::PhantomData,
     ops::Deref,
     mem,
 };
+
+use std::ffi::CStr;
+
 
 use windows_sys::Win32::{
     Foundation::{
@@ -17,6 +20,9 @@ use windows_sys::Win32::{
     NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GetIpForwardTable, GET_ADAPTERS_ADDRESSES_FLAGS,
         IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH, MIB_IPFORWARDTABLE,
+    },
+    Networking::IpHelper::{
+        GetIpForwardTable, MIB_IPFORWARDTABLE
     },
     Networking::WinSock::{
         ADDRESS_FAMILY, AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR,
@@ -82,7 +88,30 @@ pub(crate) fn list_local_ip_addresses(family: ADDRESS_FAMILY) -> Result<Vec<IpAd
         })
         .collect();
 
+
+
     Ok(local_ip_address)
+}
+
+
+fn get_gateway_for_interface(interface_ip: &Option<IpAddr>) -> Option<IpAddr> {
+    let mut table: [MIB_IPFORWARDTABLE; 1] = Default::default();
+    let mut table_size = std::mem::size_of::<MIB_IPFORWARDTABLE>() as u32;
+    
+    unsafe {
+        if GetIpForwardTable(table.as_mut_ptr() as *mut _, &mut table_size, 0) == 0 {
+            let entries = table[0].dwNumEntries;
+            let routes = slice::from_raw_parts(table[0].table, entries as usize);
+
+            for route in routes {
+                // Comprobar si la interfaz de la ruta coincide con la IP de la interfaz
+                if route.dwForwardIfIndex == interface_ip {
+                    return Some(route.dwForwardNextHop); // Esto necesita conversión a IpAddr
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Perform a search over the system's network interfaces using `GetAdaptersAddresses`,
@@ -104,9 +133,11 @@ pub(crate) fn list_local_ip_addresses(family: ADDRESS_FAMILY) -> Result<Vec<IpAd
 ///     println!("This is your local IP address: {:?}", ipaddr);
 /// }
 /// ```
-pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr)>, Error> {
+pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr, Option<String>, Option<String>, Option<IpAddr>)>, Error> {
+
     let adapter_addresses = get_adapter_addresses(AF_UNSPEC, 0)
         .map_err(|error_code| Error::StrategyError(format_error_code(error_code)))?;
+
     let adapter_addresses_iter = LinkedListIter::new(Some(adapter_addresses.ptr));
 
     let network_interfaces = adapter_addresses_iter
@@ -132,11 +163,37 @@ pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr)>, Error> {
                 slice::from_raw_parts(adapter_address.FriendlyName, len)
             };
 
-            unicast_addresses_iter.filter_map(|unicast_address| {
-                let socket_address = NonNull::new(unicast_address.Address.lpSockaddr)?;
-                get_ip_address_from_socket_address(socket_address)
-                    .map(|ip_address| (String::from_utf16_lossy(friendly_name), ip_address))
-            })
+            let service_name = unsafe {
+                std::ffi::CStr::from_ptr(adapter_address.AdapterName.as_ptr())
+                    .to_string_lossy()
+                    .into_owned()
+            };
+
+            // Obtener la MAC address
+            let mac_address = {
+                let bytes = unsafe {
+                    slice::from_raw_parts(
+                        adapter_address.PhysicalAddress.as_ptr(),
+                        adapter_address.PhysicalAddressLength as usize,
+                    )
+                };
+                bytes
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<Vec<String>>()
+                    .join(":")
+            };
+
+            let ip_address = { unicast_addresses_iter.filter_map(|unicast_address| {
+                    let socket_address = NonNull::new(unicast_address.Address.lpSockaddr)?;
+                    get_ip_address_from_socket_address(socket_address)
+                        .map(|ip_address| (String::from_utf16_lossy(friendly_name), ip_address))
+                })
+            };
+
+            let gateway = get_gateway_for_interface(&ip_address);
+
+            (friendly_name, ip_address, service_name, mac_address, gateway)
         })
         .collect();
 
