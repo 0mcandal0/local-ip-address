@@ -1,12 +1,15 @@
 use std::{
     alloc::{alloc, dealloc, Layout},
     net::{IpAddr, Ipv4Addr},
-    ptr::{NonNull, null_mut, self},
+    ptr::{NonNull, self},
     slice,
     marker::PhantomData,
     ops::Deref,
     mem,
 };
+
+use winreg::enums::*;
+use winreg::RegKey;
 
 use windows_sys::Win32::NetworkManagement::IpHelper::ConvertInterfaceLuidToIndex;
 
@@ -19,7 +22,6 @@ use windows_sys::Win32::{
     NetworkManagement::IpHelper::{
         GetAdaptersAddresses, GetIpForwardTable, GET_ADAPTERS_ADDRESSES_FLAGS,
         IP_ADAPTER_ADDRESSES_LH, IP_ADAPTER_UNICAST_ADDRESS_LH, MIB_IPFORWARDTABLE,
-        MIB_IPFORWARDROW,
     },
     Networking::WinSock::{
         ADDRESS_FAMILY, AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR,
@@ -121,13 +123,18 @@ pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr, String, String, Opti
                 String::from_utf16_lossy(slice::from_raw_parts(adapter_address.FriendlyName, len))
             };
 
-            let service_name = unsafe {
+            let connection_guid = unsafe {
                 let name_bytes = slice::from_raw_parts(adapter_address.AdapterName, 256);
-
                 let len = name_bytes.iter().position(|&x| x == 0).unwrap_or(0);
 
                 String::from_utf8_lossy(&name_bytes[..len]).into_owned()
             };
+
+            let service_name = match get_service_name(&connection_guid) {
+                Ok(name) => name,
+                Err(_) => String::new(),
+            };            
+
             let mac_address = {
                 let bytes = unsafe {
                     slice::from_raw_parts(
@@ -147,14 +154,13 @@ pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr, String, String, Opti
                     let ip_address = NonNull::new(unicast_address.Address.lpSockaddr)
                         .and_then(get_ip_address_from_socket_address)?;
                     let interface_index = adapter_address.Luid;
-
                     let mut ipv4_if_index: u32 = 0;
                     let result = unsafe {
                         ConvertInterfaceLuidToIndex(&adapter_address.Luid, &mut ipv4_if_index)
                     };
+
                     let mut gateway = None;
                     if result == 0 {
-                        println!("----------> {:?}", ipv4_if_index);
                         gateway = get_gateway_for_interface(ipv4_if_index);
                     }
 
@@ -169,6 +175,28 @@ pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr, String, String, Opti
             )
         })
         .collect())
+}
+
+
+fn get_service_name(guid: &str) -> std::io::Result<String> {
+    let reg_path = format!(
+        r"SYSTEM\CurrentControlSet\Control\Network\{{4D36E972-E325-11CE-BFC1-08002BE10318}}\{}\Connection",
+        guid
+    );
+        
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let network_key = hklm.open_subkey(reg_path)?;
+
+    let pnp_instance_id: String = network_key.get_value("PnpInstanceID")?;
+
+    let reg_path2 = format!(
+        r"SYSTEM\CurrentControlSet\Enum\{}",
+        pnp_instance_id
+    );
+    let sn = hklm.open_subkey(reg_path2)?;
+    let service_name = sn.get_value("Service")?;
+    
+    Ok(service_name)
 }
 
 fn get_gateway_for_interface(interface_index: u32) -> Option<IpAddr> {

@@ -33,6 +33,9 @@ features = [
     "Win32_System_Memory",
 ]
 
+[target.'cfg(windows)'.dependencies.winreg]
+version = "0.52.0"
+
 [[example]]
 name = "example"
 path = "examples/show_ip_and_ifs.rs"
