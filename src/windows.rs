@@ -109,7 +109,7 @@ pub(crate) fn list_local_ip_addresses(family: ADDRESS_FAMILY) -> Result<Vec<IpAd
 ///     println!("This is your local IP address: {:?}", ipaddr);
 /// }
 /// ```
-pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr, String, String, Option<IpAddr>)>, Error>
+pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr, Option<String>, Option<String>, Option<IpAddr>)>, Error>
 {
     let adapter_addresses = get_adapter_addresses(AF_UNSPEC, 0)
         .map_err(|error_code| Error::StrategyError(format_error_code(error_code)))?;
@@ -131,8 +131,8 @@ pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr, String, String, Opti
             };
 
             let service_name = match get_service_name(&connection_guid) {
-                Ok(name) => name,
-                Err(_) => String::new(),
+                Ok(name) => Some(name),
+                Err(_) => None,
             };            
 
             let mac_address = {
@@ -142,18 +142,21 @@ pub fn list_afinet_netifas() -> Result<Vec<(String, IpAddr, String, String, Opti
                         adapter_address.PhysicalAddressLength as usize,
                     )
                 };
-                bytes
-                    .iter()
-                    .map(|b| format!("{:02x}", b))
-                    .collect::<Vec<String>>()
-                    .join(":")
+                if bytes.is_empty() {
+                    None
+                } else {                
+                    Some(bytes
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<Vec<String>>()
+                        .join(":"))
+                }
             };
 
             LinkedListIter::new(NonNull::new(adapter_address.FirstUnicastAddress)).filter_map(
                 move |unicast_address| {
                     let ip_address = NonNull::new(unicast_address.Address.lpSockaddr)
                         .and_then(get_ip_address_from_socket_address)?;
-                    let interface_index = adapter_address.Luid;
                     let mut ipv4_if_index: u32 = 0;
                     let result = unsafe {
                         ConvertInterfaceLuidToIndex(&adapter_address.Luid, &mut ipv4_if_index)
